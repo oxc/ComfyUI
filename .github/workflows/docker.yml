@@ -4,11 +4,16 @@ on:
   push:
     branches:
       - master
+      - docker
   pull_request:
     branches:
       - master
   release:
     types: [published]
+  workflow_run:
+    workflows: [Rebase Upstream]
+    types:
+      - completed
 
 jobs:
   docker:
