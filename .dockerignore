@@ -1,4 +1,5 @@
-.git
+.*
+!.git
 __pycache__/
 *.py[cod]
 input

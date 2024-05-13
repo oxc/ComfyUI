@@ -58,6 +58,8 @@ RUN --mount=type=cache,target=/cache/,uid=${USER_UID},gid=${USER_GID} \
 
 COPY --chown=${USER_UID}:${USER_GID} . .
 
+COPY --chown=nobody:${USER_GID} .git .git
+
 # default environment variables
 ENV COMFYUI_ADDRESS=0.0.0.0
 ENV COMFYUI_PORT=8188
