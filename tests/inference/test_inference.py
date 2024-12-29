@@ -1,6 +1,5 @@
 from copy import deepcopy
 from io import BytesIO
-from urllib import request
 import numpy
 import os
 from PIL import Image
@@ -44,12 +43,12 @@ class ComfyGraph:
         # sets the sampler name for the sampler nodes (eg. base and refiner)
         for node in self.sampler_nodes:
             self.graph[node]['inputs']['sampler_name'] = sampler_name
-    
+
     def set_scheduler(self, scheduler:str):
         # sets the sampler name for the sampler nodes (eg. base and refiner)
         for node in self.sampler_nodes:
             self.graph[node]['inputs']['scheduler'] = scheduler
-    
+
     def set_filename_prefix(self, prefix:str):
         # sets the filename prefix for the save nodes
         for node in self.graph:
@@ -172,8 +171,8 @@ class TestInference:
             try:
                 comfy_client.connect(listen=listen, port=port)
             except ConnectionRefusedError as e:
-                print(e)
-                print(f"({i+1}/{n_tries}) Retrying...")
+                print(e)  # noqa: T201
+                print(f"({i+1}/{n_tries}) Retrying...")  # noqa: T201
             else:
                 break
         return comfy_client
@@ -186,7 +185,7 @@ class TestInference:
     @fixture(scope="class", params=comfy_graph_list, ids=comfy_graph_ids, autouse=True)
     def _client_graph(self, request, args_pytest, _server) -> (ComfyClient, ComfyGraph):
         comfy_graph = request.param
-        
+
         # Start client
         comfy_client = self.start_client(args_pytest["listen"], args_pytest["port"])
 
@@ -202,7 +201,7 @@ class TestInference:
     def client(self, _client_graph):
         client = _client_graph[0]
         yield client
-    
+
     @fixture
     def comfy_graph(self, _client_graph):
         # avoid mutating the graph

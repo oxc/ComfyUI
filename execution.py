@@ -16,7 +16,7 @@ import comfy.model_management
 from comfy_execution.graph import get_input_info, ExecutionList, DynamicPrompt, ExecutionBlocker
 from comfy_execution.graph_utils import is_link, GraphBuilder
 from comfy_execution.caching import HierarchicalCache, LRUCache, CacheKeySetInputSignature, CacheKeySetID
-from comfy.cli_args import args
+from comfy_execution.validation import validate_node_input
 
 class ExecutionResult(Enum):
     SUCCESS = 0
@@ -138,17 +138,22 @@ def _map_node_over_list(obj, input_data_all, func, allow_interrupt=False, execut
         max_len_input = 0
     else:
         max_len_input = max(len(x) for x in input_data_all.values())
-     
+
     # get a slice of inputs, repeat last input when list isn't long enough
     def slice_dict(d, i):
         return {k: v[i if len(v) > i else -1] for k, v in d.items()}
-    
+
     results = []
-    def process_inputs(inputs, index=None):
+    def process_inputs(inputs, index=None, input_is_list=False):
         if allow_interrupt:
             nodes.before_node_execution()
         execution_block = None
         for k, v in inputs.items():
+            if input_is_list:
+                for e in v:
+                    if isinstance(e, ExecutionBlocker):
+                        v = e
+                        break
             if isinstance(v, ExecutionBlocker):
                 execution_block = execution_block_cb(v) if execution_block_cb else v
                 break
@@ -160,7 +165,7 @@ def _map_node_over_list(obj, input_data_all, func, allow_interrupt=False, execut
             results.append(execution_block)
 
     if input_is_list:
-        process_inputs(input_data_all, 0)
+        process_inputs(input_data_all, 0, input_is_list=input_is_list)
     elif max_len_input == 0:
         process_inputs({})
     else: 
@@ -191,7 +196,6 @@ def merge_result_data(results, obj):
     return output
 
 def get_output_data(obj, input_data_all, execution_block_cb=None, pre_execute_cb=None):
-    
     results = []
     uis = []
     subgraph_results = []
@@ -221,7 +225,7 @@ def get_output_data(obj, input_data_all, execution_block_cb=None, pre_execute_cb
                 r = tuple([r] * len(obj.RETURN_TYPES))
             results.append(r)
             subgraph_results.append((None, r))
-    
+
     if has_subgraph:
         output = subgraph_results
     elif len(results) > 0:
@@ -480,7 +484,7 @@ class PromptExecutor:
                 if self.caches.outputs.get(node_id) is not None:
                     cached_nodes.append(node_id)
 
-            comfy.model_management.cleanup_models(keep_clone_weights_loaded=True)
+            comfy.model_management.cleanup_models_gc()
             self.add_message("execution_cached",
                           { "nodes": cached_nodes, "prompt_id": prompt_id},
                           broadcast=False)
@@ -525,7 +529,6 @@ class PromptExecutor:
             self.server.last_node_id = None
             if comfy.model_management.DISABLE_SMART_MEMORY:
                 comfy.model_management.unload_all_models()
-
 
 
 def validate_inputs(prompt, item, validated):
@@ -589,8 +592,8 @@ def validate_inputs(prompt, item, validated):
             r = nodes.NODE_CLASS_MAPPINGS[o_class_type].RETURN_TYPES
             received_type = r[val[1]]
             received_types[x] = received_type
-            if 'input_types' not in validate_function_inputs and received_type != type_input:
-                details = f"{x}, {received_type} != {type_input}"
+            if 'input_types' not in validate_function_inputs and not validate_node_input(received_type, type_input):
+                details = f"{x}, received_type({received_type}) mismatch input_type({type_input})"
                 error = {
                     "type": "return_type_mismatch",
                     "message": "Return type mismatch between linked nodes",
@@ -761,7 +764,7 @@ def validate_prompt(prompt):
         if 'class_type' not in prompt[x]:
             error = {
                 "type": "invalid_prompt",
-                "message": f"Cannot execute because a node is missing the class_type property.",
+                "message": "Cannot execute because a node is missing the class_type property.",
                 "details": f"Node ID '#{x}'",
                 "extra_info": {}
             }
