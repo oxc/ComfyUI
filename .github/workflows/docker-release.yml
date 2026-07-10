@@ -1,0 +1,103 @@
+name: Publish release Docker image
+
+# Builds and publishes versioned images for a single upstream release tag.
+# Runs from master (workflow_dispatch), so it uses the fork's build files and
+# never executes upstream's own tag workflows. Dispatched automatically by the
+# Rebase Upstream flow for each new upstream release, or manually to rebuild one.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release to build, e.g. 0.27.1 or v0.27.1
+        required: true
+        type: string
+
+concurrency:
+  group: docker-release-${{ github.event.inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      moving: ${{ steps.v.outputs.moving }}
+    steps:
+      - name: Normalize version and check if newest
+        id: v
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          UPSTREAM_URL: https://github.com/Comfy-Org/ComfyUI.git
+        run: |
+          set -euo pipefail
+          tag="$INPUT_VERSION"
+          [[ "$tag" == v* ]] || tag="v${tag}"
+          newest="$(git ls-remote --tags --refs "$UPSTREAM_URL" 'v[0-9]*.[0-9]*.[0-9]*' \
+            | sed 's#.*refs/tags/##' | sort -V | tail -1)"
+          # The newest release also gets the moving latest / major.minor tags.
+          moving=false
+          [[ "$tag" == "$newest" ]] && moving=true
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "moving=$moving" >> "$GITHUB_OUTPUT"
+          echo "Building $tag (moving=$moving)"
+
+  build:
+    needs: prepare
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      mode: release
+      ref: ${{ needs.prepare.outputs.tag }}
+      moving: ${{ needs.prepare.outputs.moving == 'true' }}
+      push: true
+    secrets: inherit
+
+  record:
+    # Record the built tag on origin only after a successful build: origin's tags
+    # are the "already built" ledger the Rebase Upstream flow diffs against.
+    #
+    # The ledger tag is an annotated tag on the fork's own master commit, not a
+    # copy of upstream's tag object. Pushing upstream's tag would upload every
+    # upstream commit origin does not have yet, and GITHUB_TOKEN can never push a
+    # commit that touches .github/workflows (there is no `workflows` permission to
+    # grant) -- so that push is rejected whenever the release is ahead of the last
+    # rebase. Pointing the tag at a commit origin already has pushes no objects at
+    # all, so it always succeeds; the upstream commit it stands for is recorded in
+    # the tag message. Pushing with GITHUB_TOKEN triggers no workflow.
+    needs: [prepare, build]
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record built tag on origin
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          UPSTREAM_URL: https://github.com/Comfy-Org/ComfyUI.git
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "${TAG} is already on origin; nothing to record."
+            exit 0
+          fi
+          # Ask for both the tag ref and its peeled form: upstream's release tags
+          # are lightweight today (no peeled ref exists), but an annotated one
+          # would need peeling to name the commit.
+          upstream_sha="$(git ls-remote "$UPSTREAM_URL" \
+            "refs/tags/${TAG}" "refs/tags/${TAG}^{}" \
+            | awk '$2 ~ /\^\{\}$/ { peeled = $1 }
+                   $2 !~ /\^\{\}$/ { plain = $1 }
+                   END { print (peeled ? peeled : plain) }')"
+          [[ -n "$upstream_sha" ]] || {
+            echo "could not resolve ${TAG} upstream" >&2
+            exit 1
+          }
+          git config user.name 'GitHub Actions'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$TAG" -m "Built release ${TAG} (upstream ${upstream_sha})" \
+            "$GITHUB_SHA"
+          git push origin "refs/tags/${TAG}"
