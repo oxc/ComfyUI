@@ -1,0 +1,83 @@
+name: Rebase Upstream
+on:
+  schedule:
+    - cron: "0 4/16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@master
+        with:
+          fetch-depth: 100  # greater than the number of commits you made
+      - name: Rebase onto upstream, keeping only the fork's workflows
+        env:
+          UPSTREAM_URL: https://github.com/Comfy-Org/ComfyUI.git
+          # The workflows the fork owns. Everything else under .github/workflows
+          # is dropped: GITHUB_TOKEN can never push a workflow file change (there
+          # is no `workflows` permission to grant), so the pushed tree has to
+          # contain exactly this set, unchanged, on every sync.
+          KEEP: docker.yml docker-build.yml docker-release.yml sync.yml
+        run: |
+          set -euxo pipefail
+          git config user.name 'GitHub Actions'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream master --depth=100
+
+          # Put upstream's workflows back before rebasing, so the fork commit we
+          # replay never deletes a file upstream might have touched (that would
+          # be a delete/modify conflict on every upstream workflow change).
+          # HEAD~1 is always an upstream commit: the fork is one commit deep.
+          git checkout HEAD~1 -- .github/workflows/
+          git commit --amend --no-edit --quiet
+
+          git rebase upstream/master
+
+          for f in .github/workflows/*; do
+            case " $KEEP " in *" ${f##*/} "*) continue ;; esac
+            git rm --quiet "$f"
+          done
+          git commit --amend --no-edit --quiet
+
+          git push --force-with-lease origin master
+
+  releases:
+    # Dispatch a release image build for every upstream release tag the fork has
+    # not built yet (origin's tags are the ledger, updated by docker-release.yml
+    # after a successful build). Independent of the rebase so a rebase conflict
+    # does not block release publishing.
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      UPSTREAM_URL: https://github.com/Comfy-Org/ComfyUI.git
+      ORIGIN_URL: https://github.com/${{ github.repository }}.git
+    steps:
+      - name: Dispatch release builds for new upstream tags
+        run: |
+          set -euo pipefail
+          list() {
+            git ls-remote --tags --refs "$1" 'v[0-9]*.[0-9]*.[0-9]*' | sed 's#.*refs/tags/##'
+          }
+          origin_tags="$(list "$ORIGIN_URL")"
+          if [[ -z "$origin_tags" ]]; then
+            echo "origin has no release tags; run the one-time bootstrap before enabling release builds." >&2
+            exit 0
+          fi
+          missing="$(comm -23 \
+            <(list "$UPSTREAM_URL" | LC_ALL=C sort -u) \
+            <(printf '%s\n' "$origin_tags" | LC_ALL=C sort -u))"
+          if [[ -z "$missing" ]]; then
+            echo "No new upstream releases."
+            exit 0
+          fi
+          for tag in $missing; do
+            echo "Dispatching release build for $tag"
+            gh workflow run docker-release.yml -f version="$tag"
+          done
