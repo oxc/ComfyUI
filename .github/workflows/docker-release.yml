@@ -1,0 +1,76 @@
+name: Publish release Docker image
+
+# Builds and publishes versioned images for a single upstream release tag.
+# Runs from master (workflow_dispatch), so it uses the fork's build files and
+# never executes upstream's own tag workflows. Dispatched automatically by the
+# Rebase Upstream flow for each new upstream release, or manually to rebuild one.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release to build, e.g. 0.27.1 or v0.27.1
+        required: true
+        type: string
+
+concurrency:
+  group: docker-release-${{ github.event.inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      moving: ${{ steps.v.outputs.moving }}
+    steps:
+      - name: Normalize version and check if newest
+        id: v
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          UPSTREAM_URL: https://github.com/Comfy-Org/ComfyUI.git
+        run: |
+          set -euo pipefail
+          tag="$INPUT_VERSION"
+          [[ "$tag" == v* ]] || tag="v${tag}"
+          newest="$(git ls-remote --tags --refs "$UPSTREAM_URL" 'v[0-9]*.[0-9]*.[0-9]*' \
+            | sed 's#.*refs/tags/##' | sort -V | tail -1)"
+          # The newest release also gets the moving latest / major.minor tags.
+          moving=false
+          [[ "$tag" == "$newest" ]] && moving=true
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "moving=$moving" >> "$GITHUB_OUTPUT"
+          echo "Building $tag (moving=$moving)"
+
+  build:
+    needs: prepare
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      mode: release
+      ref: ${{ needs.prepare.outputs.tag }}
+      moving: ${{ needs.prepare.outputs.moving == 'true' }}
+      push: true
+    secrets: inherit
+
+  mirror:
+    # Mirror the tag to origin only after a successful build, so it doubles as
+    # the "already built" ledger the Rebase Upstream flow diffs against. Pushing
+    # with GITHUB_TOKEN does not trigger any workflow (including upstream's).
+    needs: [prepare, build]
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mirror tag to origin
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          UPSTREAM_URL: https://github.com/Comfy-Org/ComfyUI.git
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 "$UPSTREAM_URL" "+refs/tags/${TAG}:refs/tags/${TAG}"
+          git push origin "refs/tags/${TAG}:refs/tags/${TAG}"

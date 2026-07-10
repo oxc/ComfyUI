@@ -1,0 +1,35 @@
+name: Build and publish Docker images
+
+# Rolling images for the moving master tip. Versioned release images are handled
+# separately by docker-release.yml (dispatched from the Rebase Upstream flow).
+on:
+  push:
+    branches:
+      - master
+      - docker
+  pull_request:
+    branches:
+      - master
+  workflow_run:
+    workflows: [Rebase Upstream]
+    types:
+      - completed
+
+# Only one build per ref at a time; cancel superseded runs to save CI minutes.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  rolling:
+    # For syncs, only build if the rebase actually succeeded.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      mode: rolling
+      push: ${{ github.event_name != 'pull_request' }}
+    secrets: inherit

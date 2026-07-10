@@ -1,3 +1,203 @@
+<!-- ============================================================= -->
+<!-- FORK MAINTENANCE (oxc/ComfyUI) — owned by this fork.          -->
+<!-- Everything below the "ComfyUI Engineering Guide" heading is   -->
+<!-- upstream's and must not be edited here.                       -->
+<!-- ============================================================= -->
+
+# Maintaining this fork
+
+This is a **thin fork of [ComfyUI](https://github.com/Comfy-Org/ComfyUI)**
+whose sole purpose is to build and publish Docker images. It carries no functional
+changes to ComfyUI itself. (The "ComfyUI Engineering Guide" section further down is
+upstream's and only applies if you ever touch ComfyUI code — which this fork should
+not.)
+
+## Golden rule: one commit on top of upstream
+
+`master` should always be **exactly `upstream/master` plus a single fork commit**
+("Add automated Docker image builds for ComfyUI"). That commit is the *only* thing
+this fork owns. Everything else must come from upstream.
+
+The fork owns exactly these files — nothing else should be modified:
+
+- `Dockerfile`
+- `.dockerignore`
+- `docker-compose.yaml`
+- `.github/workflows/docker.yml` — rolling images for the `master` tip
+- `.github/workflows/docker-release.yml` — builds versioned images for one
+  upstream release tag (per-flavor `latest` tracks the newest release)
+- `.github/workflows/docker-build.yml` — reusable build workflow that owns the
+  flavor build matrix, called by `docker.yml` and `docker-release.yml`
+- `.github/workflows/sync.yml` — rebases this fork onto upstream, prunes upstream's
+  workflows, and dispatches release builds for new upstream tags
+- `README.md` — a full replacement of upstream's, documenting the images
+- `AGENTS.md` — **only the fork-maintenance section above the "ComfyUI
+  Engineering Guide" heading**; the rest is upstream's
+- `CLAUDE.md` — one-line pointer to `AGENTS.md`
+
+Keeping it to one commit means rebasing onto upstream is trivial and the history
+stays readable. **Do not add new commits on top; amend the existing fork commit
+instead** (see below).
+
+## Remotes
+
+```
+origin    git@github.com:oxc/ComfyUI.git        # this fork
+upstream  git@github.com:Comfy-Org/ComfyUI.git
+```
+
+## Automated sync
+
+`.github/workflows/sync.yml` runs a few times a day and rebases `master` onto
+`upstream/master`. On success it triggers `docker.yml`, which rebuilds and
+republishes the images. When the rebase applies cleanly, there is nothing to do.
+
+### Why upstream's workflows are deleted
+
+`master` carries **only the fork's four workflows**; every other
+`.github/workflows/*` file is deleted by the fork commit. This is not cosmetic (though
+it does mean upstream's CI never has to be disabled by hand in the fork): `sync.yml`
+pushes with `GITHUB_TOKEN`, and that token can *never* create or update a workflow
+file — there is no `workflows` permission to grant it. Any upstream commit touching
+`.github/workflows` would therefore make the sync push fail with
+
+```
+! [remote rejected] master -> master (refusing to allow a GitHub App to create or
+  update workflow `...` without `workflows` permission)
+```
+
+Because the pruned set is fixed, the workflow files are *identical* before and after
+every sync, the push carries no workflow change, and it is allowed.
+
+The sync job does this in three steps, and the order matters:
+
+1. `git checkout HEAD~1 -- .github/workflows/` + `commit --amend` — puts upstream's
+   workflows back *before* rebasing, so the commit being replayed never deletes a file
+   upstream may have modified (that would conflict on every upstream workflow change).
+   `HEAD~1` is always an upstream commit, per the golden rule.
+2. `git rebase upstream/master`.
+3. Prune everything outside the keep-list + `commit --amend`, then push.
+
+Adding a fork workflow means adding it to `KEEP` in `sync.yml`. And note that a push
+that *changes* the pruned set (adding a workflow, or the initial pruning commit) can
+only be made **manually over SSH** — the bot can't push it.
+
+## Release images
+
+Besides the rolling `master` build, the fork publishes a versioned image for every
+upstream **release tag** (`vX.Y.Z`). The model is self-healing and needs no manual
+work once seeded:
+
+- **The Rebase Upstream flow drives it.** After rebasing, `sync.yml` diffs upstream's
+  release tags against origin's and, for each one the fork is missing, dispatches
+  `docker-release.yml` for that version (a `workflow_dispatch`, which fires even from
+  `GITHUB_TOKEN` and runs from `master`).
+- `docker-release.yml` builds that release by checking out the upstream tag and
+  **overlaying the fork's `Dockerfile` + `.dockerignore`** onto it (the tags carry no
+  Dockerfile). The tag's own `comfyui_version.py` gives the image its version, so no
+  cherry-pick is needed. Running from `master` means upstream's own tag workflows are
+  never executed.
+- On a successful build the tag is **mirrored to origin** (with `GITHUB_TOKEN`, so it
+  triggers nothing). Origin's git tags are therefore the "already built" ledger the
+  next `sync.yml` run diffs against. The newest release additionally gets the moving
+  `latest-<flavor>` and `<major>.<minor>-<flavor>` tags.
+
+`.github/workflows/docker-build.yml` is the reusable workflow that runs the actual
+per-flavor build for both the rolling and release paths.
+
+Trigger (or rebuild) a specific release manually:
+
+```shell
+gh workflow run docker-release.yml -f version=0.27.1
+```
+
+## Manual sync (when the action fails / conflicts)
+
+The auto-rebase fails when upstream changes something the fork commit also touches.
+In practice that is `README.md` (replaced wholesale) and sometimes `AGENTS.md`.
+
+```shell
+git fetch upstream
+git checkout master
+git rebase upstream/master
+```
+
+Resolving conflicts (during a rebase the sides are inverted: `--ours` is upstream,
+`--theirs` is our fork commit being replayed — always sanity-check with `git diff`):
+
+- **`README.md`** — keep the fork's version wholesale:
+  ```shell
+  git checkout --theirs README.md && git add README.md
+  ```
+- **`AGENTS.md`** — keep upstream's updated body, but **preserve the fork-maintenance
+  section at the top**. Take upstream's version, then re-apply our top section:
+  ```shell
+  git checkout --ours AGENTS.md          # upstream's new content
+  # re-add the fork-maintenance block above the "ComfyUI Engineering Guide" heading
+  git add AGENTS.md
+  ```
+- **`.github/workflows/*`** — the fork commit deletes upstream's workflows, so
+  upstream editing one gives a "deleted by us / modified by them" conflict. Keep it
+  deleted: `git rm <file>`. (The automated sync avoids this by restoring them before
+  rebasing; a manual `git rebase upstream/master` does not.)
+- **Any other file** — the fork should not be modifying upstream files. A conflict
+  elsewhere means upstream restructured something the Dockerfile depends on (see
+  below) or a stray change crept in. Resolve toward upstream and investigate.
+
+Then continue and push the rewritten history:
+
+```shell
+git rebase --continue
+git push --force-with-lease origin master
+```
+
+## Amending the fork commit
+
+To change any fork-owned file, edit it and fold it back into the single commit
+rather than stacking a new one:
+
+```shell
+git add <files>
+git commit --amend --no-edit
+git push --force-with-lease origin master
+```
+
+## What to check when upstream moves
+
+The Dockerfile and build matrix track a few upstream details. When syncing, glance
+at upstream's `README.md` install section and `requirements.txt`:
+
+- **Python version** — `ARG PYTHON_VERSION` in `Dockerfile` should match a version
+  upstream supports/recommends.
+- **PyTorch backends** — the `matrix` in `.github/workflows/docker-build.yml` pins CUDA /
+  ROCm index URLs (e.g. `cu130`, `rocm7.2`). Upstream bumps these over time; update
+  the matrix ids, names and `pytorch_install_args`, plus the variant table in
+  `README.md`, to match.
+- **System dependencies** — the image installs Python deps from upstream's
+  `requirements.txt` via pip. If upstream adds a dependency that needs system
+  libraries, add the matching `apt-get install` packages in the `Dockerfile`.
+- **Launch arguments** — the container starts with `python -u main.py --listen
+  ... --port ...`. If upstream renames or removes those flags, update the `CMD`.
+
+## Testing a build locally
+
+```shell
+docker build \
+  --build-arg PYTORCH_INSTALL_ARGS="--index-url https://download.pytorch.org/whl/cpu" \
+  --build-arg EXTRA_ARGS=--cpu \
+  -t comfyui-test .
+docker run --rm -p 8188:8188 comfyui-test
+```
+
+Then open <http://localhost:8188> to confirm the server starts. The CPU variant is
+the quickest to build for a smoke test.
+
+<!-- ============================================================= -->
+<!-- END FORK MAINTENANCE — everything below is upstream's.        -->
+<!-- ============================================================= -->
+
+# ComfyUI Engineering Guide
+
 ## Engineering Style
 
 - Keep changes small and direct. Most fixes should touch the narrowest code path
