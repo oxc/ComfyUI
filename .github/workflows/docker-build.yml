@@ -1,0 +1,166 @@
+name: Build Docker images
+
+# Reusable workflow that owns the single source of truth for the build flavor
+# matrix. Called in two modes:
+#   rolling  - build the checked-out ref (master/docker/PR) as a moving image;
+#              used by docker.yml
+#   release  - build an upstream release tag, overlaying the fork's Dockerfile
+#              onto the tagged source tree (upstream tags carry no Dockerfile);
+#              used by docker-release.yml
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: rolling | release
+        required: true
+        type: string
+      ref:
+        description: For release mode, the upstream tag to build (e.g. v0.27.1).
+        required: false
+        type: string
+        default: ""
+      moving:
+        description: Release mode only - also publish latest / major / major.minor tags.
+        required: false
+        type: boolean
+        default: false
+      push:
+        description: Push the built images (false for pull_request builds).
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: cu126
+            name: CUDA 12.6
+            pytorch_install_args: "--index-url https://download.pytorch.org/whl/cu126"
+          - id: cu126-pascal
+            name: CUDA 12.6 (Pascal sm_60/61)
+            pytorch_install_args: "--index-url https://download.pytorch.org/whl/cu126"
+            # torch 2.11 dropped pre-Turing kernels; 2.8.0 is the newest cu126
+            # build that still ships sm_60 (runs on sm_61 Pascal, e.g. Tesla P4).
+            torch_packages: "torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0"
+          - id: cu128
+            name: CUDA 12.8
+            pytorch_install_args: "--index-url https://download.pytorch.org/whl/cu128"
+          - id: cu130
+            name: CUDA 13.0
+            pytorch_install_args: "--index-url https://download.pytorch.org/whl/cu130"
+          - id: rocm7.2
+            name: ROCm 7.2
+            pytorch_install_args: "--index-url https://download.pytorch.org/whl/rocm7.2"
+          - id: cpu
+            name: CPU only
+            pytorch_install_args: "--index-url https://download.pytorch.org/whl/cpu"
+            extra_args: --cpu
+
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      # For a release build, replace the working tree with the upstream release
+      # tag's source (which carries the correct comfyui_version.py) while keeping
+      # the fork's Docker build files, which the tag does not contain.
+      - name: Check out release source
+        if: inputs.mode == 'release'
+        env:
+          TAG: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          cp Dockerfile .dockerignore "$tmp/"
+          git fetch --depth 1 https://github.com/Comfy-Org/ComfyUI.git \
+            "+refs/tags/${TAG}:refs/tags/${TAG}"
+          git checkout --force --detach "refs/tags/${TAG}"
+          cp "$tmp/Dockerfile" "$tmp/.dockerignore" .
+      - name: Check which repositories to use
+        id: repositories
+        run: |
+          echo "GHCR_IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER}/comfyui" >> "$GITHUB_ENV"
+          if [[ -n "${DOCKERHUB_USERNAME}" ]]; then
+            echo "DOCKERHUB_IMAGE_NAME=${DOCKERHUB_USERNAME}/comfyui" >> "$GITHUB_ENV"
+          else
+            echo "DOCKERHUB_IMAGE_NAME=" >> "$GITHUB_ENV"
+            echo "No Docker Hub username set, only deploying to GitHub Container Repository"
+          fi
+        env:
+            DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+            GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+      - name: Derive release version
+        id: version
+        if: inputs.mode == 'release'
+        env:
+          TAG: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          {
+            echo "version=${version}"
+            echo "major_minor=${version%.*}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # list of Docker images to use as base name for tags
+          images: |
+            ${{ env.DOCKERHUB_IMAGE_NAME }}
+            ${{ env.GHCR_IMAGE_NAME }}
+          flavor: |
+            suffix=-${{ matrix.id }},onlatest=true
+          # Rolling builds get the branch (e.g. master-<flavor>), pr and sha tags;
+          # release builds get the immutable version tag, and the newest release
+          # additionally gets the moving major.minor and latest tags (inputs.moving).
+          tags: |
+            type=ref,event=branch,enable=${{ inputs.mode == 'rolling' }}
+            type=ref,event=pr,enable=${{ inputs.mode == 'rolling' }}
+            type=sha,enable=${{ inputs.mode == 'rolling' }}
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ inputs.mode == 'release' }}
+            type=raw,value=${{ steps.version.outputs.major_minor }},enable=${{ inputs.mode == 'release' && inputs.moving }}
+            type=raw,value=latest,enable=${{ inputs.mode == 'release' && inputs.moving }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        if: inputs.push && env.DOCKERHUB_IMAGE_NAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to GHCR
+        if: inputs.push
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PYTORCH_INSTALL_ARGS=${{ matrix.pytorch_install_args }}
+            TORCH_PACKAGES=${{ matrix.torch_packages }}
+            EXTRA_ARGS=${{ matrix.extra_args }}
+          # Cache scope is the variant id only, deliberately NOT the ref: a
+          # release build for a fresh upstream tag must reuse the layers the
+          # previous release populated, otherwise torch is rebuilt from scratch
+          # and ships a new layer digest every release -> every host re-pulls
+          # the full ~3.5 GB torch layer even though the version is unchanged.
+          # Registry-backed (not type=gha) so it survives GHA's 10 GB LRU cap.
+          # cache-to only when we are pushing, since it needs GHCR auth (the
+          # login step above is likewise gated on inputs.push).
+          cache-from: type=registry,ref=${{ env.GHCR_IMAGE_NAME }}:buildcache-${{ matrix.id }}
+          cache-to: ${{ inputs.push && format('type=registry,ref={0}:buildcache-{1},mode=max', env.GHCR_IMAGE_NAME, matrix.id) || '' }}
